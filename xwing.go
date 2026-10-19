@@ -1,6 +1,20 @@
+// Package xwing implements X-Wing, a general-purpose hybrid post-quantum KEM
+// as defined in draft-connolly-cfrg-xwing-kem-11.html dated 23 September 2026.
+//
+// This is an EDUCATIONAL project and is not verified/recommended for usage
+// in any software.
+//
+// Authors of the draft:
+//   - Deirdre Connolly Selkie Cryptography durumcrustulum@gmail.com
+//   - Peter Schwabe MPI-SP & Radboud University peter@cryptojedi.org
+//   - Bas Westerbaan Cloudflare bas@cloudflare.com
+//
+// Source:
+// https://www.ietf.org/archive/id/draft-connolly-cfrg-xwing-kem-11.html
 package xwing
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/mlkem"
 	"crypto/rand"
@@ -9,135 +23,242 @@ import (
 	"fmt"
 )
 
+// This implementation uses the following naming conventions:
+// 	- sk = Secret Key/Private Key/Decapsulation Key
+//	- pk = Public Key/Encapsulation Key
+//	- ss = Shared Secret
+// 	- ct = Ciphertext
+//	- m  = ML-KEM-768
+// 	- x  = X25519
+//
+// Those are used interchangeably in code and documentation.
+// Decapsulation Key and Encapsulation Key were preferred
+// to match the implementation of ML-KEM.
+
 const (
-	SecretKeySize  = 32
-	PublicKeySize  = 1216
+	// DecapsulationKeySize is the size of the decapsulation key in bytes.
+	DecapsulationKeySize = 32
+
+	// EncapsulationKeySize is the size of the encapsulation key in bytes.
+	// ML-KEM-768 key (1184) || X25519 key (32)
+	EncapsulationKeySize = 1216
+
+	// CiphertextSize is the size of the ciphertext
+	// produced by X-Wing in bytes.
+	// ML-KEM ciphertext (1088) || X25519 ciphertext (32)
 	CiphertextSize = 1120
 
-	SharedSecretSize      = 32
-	ExpandedSecretKeySize = 96
+	// SharedSecretSize is the size of the shared secret
+	// produced by X-Wing in bytes.
+	SharedSecretSize = 32
+
+	// expandedDecapsulationKeySize is the size to which
+	// SumSHAKE256 expands the decapsulation key.
+	expandedDecapsulationKeySize = 96
 )
 
 var (
-	ErrInvalidPublicKey = errors.New("invalid public key")
+	// ErrInvalidEncapsulationKey is returned when the provided encapsulation key
+	// is invalid: length mismatch, invalid x25519 or mlkem keys.
+	ErrInvalidEncapsulationKey = errors.New("invalid encapsulation key")
 
-	ErrInvalidCipherText = errors.New("invalid cipher text")
+	// ErrInvalidDecapsulationKey is returned when the provided decapsulation key
+	// is invalid: length mismatch, invalid x25519 or mlkem keys.
+	ErrInvalidDecapsulationKey = errors.New("invalid decapsulation key")
+
+	// ErrInvalidCiphertext is returned when the provided ciphertext
+	// is invalid: length mismatch, invalid x25519 ciphertext.
+	ErrInvalidCiphertext = errors.New("invalid ciphertext")
 )
 
+// xWingLabel is a constant defined in the draft.
+// It is appended at the end of combiner before taking the hashsum.
+//
+//	\./
+//	/^\
 var xWingLabel = []byte{0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c}
 
-type PrivateKey struct {
-	secretKey [SecretKeySize]byte
+// GenerateKeyPair creates a pair of Decapsulation and Encapsulation keys
+// using a secure entropy source.
+func GenerateKeyPair() (*DecapsulationKey, *EncapsulationKey, error) {
+	seed := make([]byte, DecapsulationKeySize)
+	_, _ = rand.Read(seed) // rand.Read never errors and always fills the buffer
 
-	secretKeyM *mlkem.DecapsulationKey768
-
-	secretKeyX *ecdh.PrivateKey
-	publicKeyX []byte
-}
-
-func GenerateKeyPair() (*PrivateKey, []byte, error) {
-	secretKey := make([]byte, SecretKeySize)
-	_, _ = rand.Read(secretKey) // rand.Read never errors and always fills the buffer
-
-	skM, skX, pkM, pkX, err := expandSecretKey(secretKey)
+	skM, skX, pkM, pkX, err := expandSecretKey(seed)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	publicKey := append(pkM, pkX...)
-	return &PrivateKey{
-		secretKey:  *(*[SecretKeySize]byte)(secretKey),
-		secretKeyM: skM,
-		secretKeyX: skX,
-		publicKeyX: pkX,
-	}, publicKey, nil
+	return &DecapsulationKey{
+		seed: seed,
+		skM:  skM,
+		skX:  skX,
+	}, &EncapsulationKey{
+		pkM: pkM,
+		pkX: pkX,
+	}, nil
 }
 
-func Encapsulate(publicKey []byte) (sharedSecret, ciphertext []byte, err error) {
-	if len(publicKey) != PublicKeySize {
-		return nil, nil,
-			fmt.Errorf("%w: invalid length want = %d, got = %d", ErrInvalidPublicKey, PublicKeySize, len(publicKey))
-	}
+// DecapsulationKey represents the Decapsulation Key of X-Wing KEM.
+// It caches the necessary keys of mlkem and x25519 for faster decapsulation.
+// Only seed should ever be exposed via the Bytes method.
+//
+// Create with NewDecapsulationKey or GenerateKeyPair.
+type DecapsulationKey struct {
+	seed []byte
 
-	publicKeyMbytes := publicKey[:mlkem.EncapsulationKeySize768]
-	publicKeyXbytes := publicKey[mlkem.EncapsulationKeySize768:]
-
-	ephemeralKeyX, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-	ciphertextX := ephemeralKeyX.PublicKey().Bytes()
-
-	publicKeyX, err := ecdh.X25519().NewPublicKey(publicKeyXbytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidPublicKey, err)
-	}
-
-	sharedSecretX, err := ephemeralKeyX.ECDH(publicKeyX)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidPublicKey, err)
-	}
-
-	publicKeyM, err := mlkem.NewEncapsulationKey768(publicKeyMbytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidPublicKey, err)
-	}
-	sharedSecretM, ciphertextM := publicKeyM.Encapsulate()
-
-	sharedSecret = combiner(sharedSecretM, sharedSecretX, ciphertextX, publicKeyX.Bytes())
-	return sharedSecret, append(ciphertextM, ciphertextX...), nil
+	// cached
+	skM *mlkem.DecapsulationKey768
+	skX *ecdh.PrivateKey
 }
 
-func (k *PrivateKey) Decapsulate(ciphertext []byte) (sharedSecret []byte, err error) {
+// NewDecapsulationKey initializes a new DecapsulationKey with key as the seed.
+// It errors with ErrInvalidDecapsulationKey when the length of the provided key
+// does not match DecapsulationKeySize.
+func NewDecapsulationKey(key []byte) (*DecapsulationKey, error) {
+	if len(key) != DecapsulationKeySize {
+		return nil, fmt.Errorf("%w: length mismatch: want = %d, got = %d",
+			ErrInvalidDecapsulationKey, DecapsulationKeySize, len(key))
+	}
+
+	k := bytes.Clone(key)
+	skM, skX, _, _, err := expandSecretKey(k)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidDecapsulationKey, err)
+	}
+
+	return &DecapsulationKey{
+		seed: k,
+		skM:  skM,
+		skX:  skX,
+	}, nil
+}
+
+// Decapsulate recovers the shared secret from the provided ciphertext.
+// It errors with ErrInvalidCiphertext when the length of the provided ciphertext
+// does not match CiphertextSize or x25519 ciphertext is invalid.
+func (d *DecapsulationKey) Decapsulate(ciphertext []byte) (sharedSecret []byte, err error) {
 	if len(ciphertext) != CiphertextSize {
-		return nil,
-			fmt.Errorf("%w: invalid length want = %d, got = %d", ErrInvalidCipherText, CiphertextSize, len(ciphertext))
+		return nil, fmt.Errorf("%w: length mismatch: want = %d, got = %d",
+			ErrInvalidCiphertext, CiphertextSize, len(ciphertext))
 	}
 
-	ciphertextM := ciphertext[:mlkem.CiphertextSize768]
-	ciphertextX := ciphertext[mlkem.CiphertextSize768:]
+	ctM := ciphertext[:mlkem.CiphertextSize768]
+	ctX := ciphertext[mlkem.CiphertextSize768:]
 
-	sharedSecretM, err := k.secretKeyM.Decapsulate(ciphertextM)
+	ssM, err := d.skM.Decapsulate(ctM)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidCipherText, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCiphertext, err)
 	}
 
-	publicKeyX, err := ecdh.X25519().NewPublicKey(ciphertextX)
+	ctKey, err := ecdh.X25519().NewPublicKey(ctX)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidCipherText, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCiphertext, err)
 	}
 
-	sharedSecretX, err := k.secretKeyX.ECDH(publicKeyX)
+	ssX, err := d.skX.ECDH(ctKey)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidCipherText, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCiphertext, err)
 	}
 
-	return combiner(sharedSecretM, sharedSecretX, ciphertextX, k.publicKeyX), nil
+	return combiner(ssM, ssX, ctX, d.skX.PublicKey().Bytes()), nil
 }
 
-func expandSecretKey(secretKey []byte) (skM *mlkem.DecapsulationKey768, skX *ecdh.PrivateKey, pkM, pkX []byte, err error) {
-	expanded := sha3.SumSHAKE256(secretKey, ExpandedSecretKeySize)
-	secretKeyM, err := mlkem.NewDecapsulationKey768(expanded[:64])
+// Bytes returns a copy of the key in bytes.
+func (d *DecapsulationKey) Bytes() []byte {
+	return bytes.Clone(d.seed)
+}
+
+// EncapsulationKey returns the corresponding EncapsulationKey.
+func (d *DecapsulationKey) EncapsulationKey() *EncapsulationKey {
+	return &EncapsulationKey{
+		pkM: d.skM.EncapsulationKey(),
+		pkX: d.skX.PublicKey(),
+	}
+}
+
+// EncapsulationKey represents the Encapsulation Key of X-Wing KEM.
+//
+// Create with NewEncapsulationKey or GenerateKeyPair.
+type EncapsulationKey struct {
+	pkM *mlkem.EncapsulationKey768
+	pkX *ecdh.PublicKey
+}
+
+// NewEncapsulationKey parses the provided key and returns it as a new EncapsulationKey.
+// It errors with ErrInvalidEncapsulationKey when the length of the provided key
+// does not match EncapsulationKeySize or ml-kem encoding is invalid.
+func NewEncapsulationKey(key []byte) (*EncapsulationKey, error) {
+	if len(key) != EncapsulationKeySize {
+		return nil, fmt.Errorf("%w: length mismatch: want = %d, got = %d",
+			ErrInvalidEncapsulationKey, EncapsulationKeySize, len(key))
+	}
+
+	pkM, err := mlkem.NewEncapsulationKey768(key[:mlkem.EncapsulationKeySize768])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+
+	pkX, err := ecdh.X25519().NewPublicKey(key[mlkem.EncapsulationKeySize768:])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+
+	return &EncapsulationKey{
+		pkM: pkM,
+		pkX: pkX,
+	}, nil
+}
+
+// Encapsulate creates a shared secret and its corresponding ciphertext.
+// It errors with ErrInvalidEncapsulationKey when x25519 key is invalid.
+func (e *EncapsulationKey) Encapsulate() (sharedSecret, ciphertext []byte, err error) {
+	ekX, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+	ctX := ekX.PublicKey().Bytes()
+
+	ssX, err := ekX.ECDH(e.pkX)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+
+	ssM, ctM := e.pkM.Encapsulate()
+
+	sharedSecret = combiner(ssM, ssX, ctX, e.pkX.Bytes())
+	return sharedSecret, append(ctM, ctX...), nil
+}
+
+// Bytes returns a copy of the key in bytes.
+func (e *EncapsulationKey) Bytes() []byte {
+	// both return a copy
+	return append(e.pkM.Bytes(), e.pkX.Bytes()...)
+}
+
+func expandSecretKey(secretKey []byte) (skM *mlkem.DecapsulationKey768, skX *ecdh.PrivateKey, pkM *mlkem.EncapsulationKey768, pkX *ecdh.PublicKey, err error) {
+	expanded := sha3.SumSHAKE256(secretKey, expandedDecapsulationKeySize)
+	skM, err = mlkem.NewDecapsulationKey768(expanded[:64])
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	publicKeyM := secretKeyM.EncapsulationKey().Bytes()
+	pkM = skM.EncapsulationKey()
 
-	secretKeyX, err := ecdh.X25519().NewPrivateKey(expanded[64:])
+	skX, err = ecdh.X25519().NewPrivateKey(expanded[64:])
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	publicKeyX := secretKeyX.PublicKey().Bytes()
+	pkX = skX.PublicKey()
 
-	return secretKeyM, secretKeyX, publicKeyM, publicKeyX, nil
+	return skM, skX, pkM, pkX, nil
 }
 
-func combiner(sharedSecretM, sharedSecretX, ciphertextX, publicKeyX []byte) []byte {
+func combiner(ssM, ssX, ctX, pkX []byte) []byte {
 	h := sha3.New256()
-	_, _ = h.Write(sharedSecretM)
-	_, _ = h.Write(sharedSecretX)
-	_, _ = h.Write(ciphertextX)
-	_, _ = h.Write(publicKeyX)
+	_, _ = h.Write(ssM)
+	_, _ = h.Write(ssX)
+	_, _ = h.Write(ctX)
+	_, _ = h.Write(pkX)
 	_, _ = h.Write(xWingLabel)
 
 	return h.Sum(nil)
