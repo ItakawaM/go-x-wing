@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/mlkem"
+	"crypto/mlkem/mlkemtest"
 	"crypto/rand"
 	"crypto/sha3"
 	"errors"
@@ -82,9 +83,14 @@ var xWingLabel = []byte{0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c}
 // using a secure entropy source.
 func GenerateKeyPair() (*DecapsulationKey, *EncapsulationKey, error) {
 	seed := make([]byte, DecapsulationKeySize)
-	_, _ = rand.Read(seed) // rand.Read never errors and always fills the buffer
+	_, _ = rand.Read(seed) // never errors
+	return generateKeyPair(seed)
+}
 
-	skM, skX, pkM, pkX, err := expandSecretKey(seed)
+// generateKeyPair generates an X-Wing key pair from the provided seed.
+// It should be used for deterministic testing.
+func generateKeyPair(seed []byte) (*DecapsulationKey, *EncapsulationKey, error) {
+	skM, skX, pkM, pkX, err := expandDecapsulationKey(seed)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -113,7 +119,7 @@ type DecapsulationKey struct {
 }
 
 // NewDecapsulationKey initializes a new DecapsulationKey with key as the seed.
-// It errors with ErrInvalidDecapsulationKey when the length of the provided key
+// It returns ErrInvalidDecapsulationKey when the length of the provided key
 // does not match DecapsulationKeySize.
 func NewDecapsulationKey(key []byte) (*DecapsulationKey, error) {
 	if len(key) != DecapsulationKeySize {
@@ -122,7 +128,7 @@ func NewDecapsulationKey(key []byte) (*DecapsulationKey, error) {
 	}
 
 	k := bytes.Clone(key)
-	skM, skX, _, _, err := expandSecretKey(k)
+	skM, skX, _, _, err := expandDecapsulationKey(k)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidDecapsulationKey, err)
 	}
@@ -135,7 +141,7 @@ func NewDecapsulationKey(key []byte) (*DecapsulationKey, error) {
 }
 
 // Decapsulate recovers the shared secret from the provided ciphertext.
-// It errors with ErrInvalidCiphertext when the length of the provided ciphertext
+// It returns ErrInvalidCiphertext when the length of the provided ciphertext
 // does not match CiphertextSize or x25519 ciphertext is invalid.
 func (d *DecapsulationKey) Decapsulate(ciphertext []byte) (sharedSecret []byte, err error) {
 	if len(ciphertext) != CiphertextSize {
@@ -186,7 +192,7 @@ type EncapsulationKey struct {
 }
 
 // NewEncapsulationKey parses the provided key and returns it as a new EncapsulationKey.
-// It errors with ErrInvalidEncapsulationKey when the length of the provided key
+// It returns ErrInvalidEncapsulationKey when the length of the provided key
 // does not match EncapsulationKeySize or ml-kem encoding is invalid.
 func NewEncapsulationKey(key []byte) (*EncapsulationKey, error) {
 	if len(key) != EncapsulationKeySize {
@@ -211,7 +217,7 @@ func NewEncapsulationKey(key []byte) (*EncapsulationKey, error) {
 }
 
 // Encapsulate creates a shared secret and its corresponding ciphertext.
-// It errors with ErrInvalidEncapsulationKey when x25519 key is invalid.
+// It returns ErrInvalidEncapsulationKey when x25519 key is invalid.
 func (e *EncapsulationKey) Encapsulate() (sharedSecret, ciphertext []byte, err error) {
 	ekX, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -230,14 +236,38 @@ func (e *EncapsulationKey) Encapsulate() (sharedSecret, ciphertext []byte, err e
 	return sharedSecret, append(ctM, ctX...), nil
 }
 
+// encapsulate is a deterministic Encapsulate implementation for testing.
+func (e *EncapsulationKey) encapsulate(seed []byte) (sharedSecret, ciphertext []byte, err error) {
+	ekX, err := ecdh.X25519().NewPrivateKey(seed[32:])
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+	ctX := ekX.PublicKey().Bytes()
+
+	ssX, err := ekX.ECDH(e.pkX)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+
+	ssM, ctM, err := mlkemtest.Encapsulate768(e.pkM, seed[:32])
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	}
+
+	sharedSecret = combiner(ssM, ssX, ctX, e.pkX.Bytes())
+	return sharedSecret, append(ctM, ctX...), nil
+}
+
 // Bytes returns a copy of the key in bytes.
 func (e *EncapsulationKey) Bytes() []byte {
 	// both return a copy
 	return append(e.pkM.Bytes(), e.pkX.Bytes()...)
 }
 
-func expandSecretKey(secretKey []byte) (skM *mlkem.DecapsulationKey768, skX *ecdh.PrivateKey, pkM *mlkem.EncapsulationKey768, pkX *ecdh.PublicKey, err error) {
-	expanded := sha3.SumSHAKE256(secretKey, expandedDecapsulationKeySize)
+// expandDecapsulationKey expands decapsulationKey using SHAKE256
+// and constructs ml-kem and x25519 key pairs.
+func expandDecapsulationKey(decapsulationKey []byte) (skM *mlkem.DecapsulationKey768, skX *ecdh.PrivateKey, pkM *mlkem.EncapsulationKey768, pkX *ecdh.PublicKey, err error) {
+	expanded := sha3.SumSHAKE256(decapsulationKey, expandedDecapsulationKeySize)
 	skM, err = mlkem.NewDecapsulationKey768(expanded[:64])
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -253,6 +283,7 @@ func expandSecretKey(secretKey []byte) (skM *mlkem.DecapsulationKey768, skX *ecd
 	return skM, skX, pkM, pkX, nil
 }
 
+// combiner creates a shared secret by hashing the provided values with SHA3-256.
 func combiner(ssM, ssX, ctX, pkX []byte) []byte {
 	h := sha3.New256()
 	_, _ = h.Write(ssM)
