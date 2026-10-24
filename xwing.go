@@ -5,9 +5,9 @@
 // in any software.
 //
 // Authors of the draft:
-//   - Deirdre Connolly Selkie Cryptography durumcrustulum@gmail.com
-//   - Peter Schwabe MPI-SP & Radboud University peter@cryptojedi.org
-//   - Bas Westerbaan Cloudflare bas@cloudflare.com
+//   - Deirdre Connolly Selkie Cryptography
+//   - Peter Schwabe MPI-SP & Radboud University
+//   - Bas Westerbaan Cloudflare
 //
 // Source:
 // https://www.ietf.org/archive/id/draft-connolly-cfrg-xwing-kem-11.html
