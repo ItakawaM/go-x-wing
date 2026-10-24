@@ -8,12 +8,19 @@ import (
 	"testing"
 )
 
+const eseedSize = 64
+
 // encapsulate is a deterministic Encapsulate implementation for testing.
 func (e *EncapsulationKey) encapsulate(seed []byte) (sharedSecret, ciphertext []byte, err error) {
-	ekX, err := ecdh.X25519().NewPrivateKey(seed[32:])
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
+	if fipsEnforced() {
+		return nil, nil, ErrUnsupported
 	}
+
+	if len(seed) != eseedSize {
+		return nil, nil, ErrInvalidEncapsulationKey
+	}
+
+	ekX := must(ecdh.X25519().NewPrivateKey(seed[32:]))
 	ctX := ekX.PublicKey().Bytes()
 
 	ssX, err := ekX.ECDH(e.pkX)

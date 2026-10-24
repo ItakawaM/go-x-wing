@@ -97,3 +97,79 @@ func FuzzXWing(f *testing.F) {
 		AssertBytesEqual(t, gotss, ss)
 	})
 }
+
+func enforceFIPS(t *testing.T) {
+	t.Helper()
+	old := fipsEnforced
+	fipsEnforced = func() bool { return true }
+	t.Cleanup(func() { fipsEnforced = old })
+}
+
+func TestErrUnsupported(t *testing.T) {
+	sk, pk, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() error = %v", err)
+	}
+	_, ct, err := pk.Encapsulate()
+	if err != nil {
+		t.Fatalf("Encapsulate() error = %v", err)
+	}
+
+	enforceFIPS(t)
+
+	t.Run("GenerateKeyPair", func(t *testing.T) {
+		sk, pk, err := GenerateKeyPair()
+		AssertError(t, err, ErrUnsupported)
+		if sk != nil || pk != nil {
+			t.Error("GenerateKeyPair() returned non-nil keys with an error")
+		}
+	})
+
+	t.Run("generateKeyPair", func(t *testing.T) {
+		sk, pk, err := generateKeyPair(make([]byte, DecapsulationKeySize))
+		AssertError(t, err, ErrUnsupported)
+		if sk != nil || pk != nil {
+			t.Error("generateKeyPair() returned non-nil keys with an error")
+		}
+	})
+
+	t.Run("NewDecapsulationKey", func(t *testing.T) {
+		k, err := NewDecapsulationKey(sk.Bytes())
+		AssertError(t, err, ErrUnsupported)
+		if k != nil {
+			t.Error("NewDecapsulationKey() returned a non-nil key with an error")
+		}
+	})
+
+	t.Run("NewEncapsulationKey", func(t *testing.T) {
+		k, err := NewEncapsulationKey(pk.Bytes())
+		AssertError(t, err, ErrUnsupported)
+		if k != nil {
+			t.Error("NewEncapsulationKey() returned a non-nil key with an error")
+		}
+	})
+
+	t.Run("Encapsulate", func(t *testing.T) {
+		ss, ct, err := pk.Encapsulate()
+		AssertError(t, err, ErrUnsupported)
+		if ss != nil || ct != nil {
+			t.Error("Encapsulate() returned non-nil output with an error")
+		}
+	})
+
+	t.Run("Decapsulate", func(t *testing.T) {
+		ss, err := sk.Decapsulate(ct)
+		AssertError(t, err, ErrUnsupported)
+		if ss != nil {
+			t.Error("Decapsulate() returned a non-nil secret with an error")
+		}
+	})
+
+	t.Run("encapsulate", func(t *testing.T) {
+		ss, ct, err := pk.encapsulate(make([]byte, eseedSize))
+		AssertError(t, err, ErrUnsupported)
+		if ss != nil || ct != nil {
+			t.Error("encapsulate() returned non-nil output with an error")
+		}
+	})
+}
