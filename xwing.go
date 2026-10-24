@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/mlkem"
-	"crypto/mlkem/mlkemtest"
 	"crypto/rand"
 	"crypto/sha3"
 	"errors"
@@ -231,28 +230,6 @@ func (e *EncapsulationKey) Encapsulate() (sharedSecret, ciphertext []byte, err e
 	}
 
 	ssM, ctM := e.pkM.Encapsulate()
-
-	sharedSecret = combiner(ssM, ssX, ctX, e.pkX.Bytes())
-	return sharedSecret, append(ctM, ctX...), nil
-}
-
-// encapsulate is a deterministic Encapsulate implementation for testing.
-func (e *EncapsulationKey) encapsulate(seed []byte) (sharedSecret, ciphertext []byte, err error) {
-	ekX, err := ecdh.X25519().NewPrivateKey(seed[32:])
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
-	}
-	ctX := ekX.PublicKey().Bytes()
-
-	ssX, err := ekX.ECDH(e.pkX)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
-	}
-
-	ssM, ctM, err := mlkemtest.Encapsulate768(e.pkM, seed[:32])
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidEncapsulationKey, err)
-	}
 
 	sharedSecret = combiner(ssM, ssX, ctX, e.pkX.Bytes())
 	return sharedSecret, append(ctM, ctX...), nil
